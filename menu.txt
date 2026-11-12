@@ -1,0 +1,12 @@
+# 0 = first course, 1 = second course
+0 Pasta al pomodoro
+0 Risotto ai funghi
+0 Lasagne
+1 Pollo arrosto
+1 Parmigiana
+1 Pesce al forno
+2 Normale
+2 Macchiato
+2 Decaffeinato
+2 Ginseng
+3 Tiramisu
