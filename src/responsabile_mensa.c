@@ -1,6 +1,8 @@
 #include "common.h"
 #include <sys/wait.h>
 
+#define BIN_DIR "./bin"
+
 static int shm_id, sem_id, msg_id;
 static Shared *shared;
 static pid_t children[512];
@@ -65,10 +67,23 @@ static int load_menu(Config *c) {
     return c->n_dishes[0]>=2 && c->n_dishes[1]>=2 && c->coffee_types>=4 && c->dessert_count>=1 ? 0 : -1;
 }
 static void launch(const char *exe, const char *arg) {
-    pid_t p=fork();
-    if (p==0) { execl(exe,exe,arg,(char *)NULL); perror("exec"); _exit(127); }
-    if (p<0 || child_count>=512) { perror("fork"); exit(EXIT_FAILURE); }
-    children[child_count++]=p;
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", BIN_DIR, exe);
+
+    pid_t p = fork();
+    if (p == 0) {
+        if (arg)
+            execl(path, exe, arg, (char *)NULL);
+        else
+            execl(path, exe, (char *)NULL);
+        perror("exec");
+        _exit(127);
+    }
+    if (p < 0 || child_count >= 512) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
+    children[child_count++] = p;
 }
 static void print_stats(int day, int days) {
     lock_shared(sem_id);
@@ -116,9 +131,9 @@ int main(int argc,char **argv) {
         int started=0;
         for(int s=0;s<4;s++)for(int n=0;n<allocation[s];n++){
             char a[8];snprintf(a,sizeof a,"%d",s+1);
-            launch(s==3?"./operatore_cassa":"./operatore",s==3?NULL:a);started++;
+            launch(s==3?"operatore_cassa":"operatore",s==3?NULL:a);started++;
         }
-        for(int u=0;u<cfg.users;u++) launch("./utente","0");
+        for(int u=0;u<cfg.users;u++) launch("utente","0");
         started+=cfg.users;
         for(int n=0;n<started;n++)sem_p(sem_id,SEM_START);
         for(int n=0;n<started;n++)sem_v(sem_id,SEM_GATE);
