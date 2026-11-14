@@ -116,9 +116,9 @@ int main(int argc,char **argv) {
         int started=0;
         for(int s=0;s<4;s++)for(int n=0;n<allocation[s];n++){
             char a[8];snprintf(a,sizeof a,"%d",s+1);
-            launch(s==3?"./operatore_cassa":"./operatore",s==3?NULL:a);started++;
+            launch(s==3?"./bin/operatore_cassa":"./bin/operatore",s==3?NULL:a);started++;
         }
-        for(int u=0;u<cfg.users;u++) launch("./utente","0");
+        for(int u=0;u<cfg.users;u++) launch("./bin/utente","0");
         started+=cfg.users;
         for(int n=0;n<started;n++)sem_p(sem_id,SEM_START);
         for(int n=0;n<started;n++)sem_v(sem_id,SEM_GATE);
