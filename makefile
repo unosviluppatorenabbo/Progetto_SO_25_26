@@ -21,10 +21,16 @@ $(BIN_DIR)/operatore_cassa: $(SRCDIR)/operatore_cassa.c $(SRCDIR)/helpers.c comm
 $(BIN_DIR)/utente: $(SRCDIR)/utente.c $(SRCDIR)/helpers.c common.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(SRCDIR)/utente.c $(SRCDIR)/helpers.c -o $@
 
-.PHONY: all start clean
+.PHONY: all start timeout overload clean
 
 start: $(BIN_DIR)/responsabile_mensa
 	./$(BIN_DIR)/responsabile_mensa
+
+timeout: $(TARGETS)
+	./$(BIN_DIR)/responsabile_mensa "config timeout.conf"
+
+overload: $(TARGETS)
+	./$(BIN_DIR)/responsabile_mensa "config overload.conf"
 
 clean:
 	rm -f $(TARGETS)
