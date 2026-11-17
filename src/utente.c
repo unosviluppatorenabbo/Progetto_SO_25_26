@@ -1,10 +1,18 @@
 #include "common.h"
 
-static double elapsed_sim_minutes(const Config *cfg, struct timespec begin,
-                                  struct timespec end) {
-  double elapsed_ns = (end.tv_sec - begin.tv_sec) * 1000000000.0 +
-                      (end.tv_nsec - begin.tv_nsec);
-  return cfg->minute_ns > 0 ? elapsed_ns / cfg->minute_ns : 0.0;
+static void handle_stop_signal(int signal) { (void)signal; }
+
+static void record_unserved(int sid, Shared *sh) {
+  lock_shared(sid);
+  sh->unserved++;
+  sh->day_unserved++;
+  unlock_shared(sid);
+}
+
+static double simulated_minutes(const Config *cfg, long long elapsed_ns) {
+  return cfg->minute_ns > 0 && elapsed_ns > 0
+             ? (double)elapsed_ns / cfg->minute_ns
+             : 0.0;
 }
 
 static int request_service(int sid, int mid, Shared *sh, int station, int dish,
@@ -15,14 +23,20 @@ static int request_service(int sid, int mid, Shared *sh, int station, int dish,
                  .dish = dish,
                  .coffee = coffee};
   int idx = station - 1;
-  struct timespec begin, end;
-  clock_gettime(CLOCK_MONOTONIC, &begin);
-
   lock_shared(sid);
+  if (!sh->active) {
+    unlock_shared(sid);
+    return 0;
+  }
   sh->queue[idx]++;
   unlock_shared(sid);
 
+  req.enqueued_ns = monotonic_time_ns();
   if (msgsnd(mid, &req, sizeof req - sizeof(long), 0) < 0) {
+    lock_shared(sid);
+    if (sh->queue[idx] > 0)
+      sh->queue[idx]--;
+    unlock_shared(sid);
     return 0;
   }
 
@@ -31,8 +45,7 @@ static int request_service(int sid, int mid, Shared *sh, int station, int dish,
     return 0;
   }
 
-  clock_gettime(CLOCK_MONOTONIC, &end);
-  double wait_minutes = elapsed_sim_minutes(&sh->cfg, begin, end);
+  double wait_minutes = simulated_minutes(&sh->cfg, rep.queue_wait_ns);
 
   lock_shared(sid);
   sh->wait_minutes[idx] += wait_minutes;
@@ -56,6 +69,10 @@ int main(void) {
   if (sh == (void *)-1) {
     return 2;
   }
+  struct sigaction action = {.sa_handler = handle_stop_signal};
+  sigemptyset(&action.sa_mask);
+  sigaction(SIGTERM, &action, NULL);
+  sigaction(SIGINT, &action, NULL);
 
   unsigned int seed = (unsigned int)getpid() ^ (unsigned int)time(NULL);
   sem_v(sid, SEM_START);
@@ -78,34 +95,32 @@ int main(void) {
   }
   unlock_shared(sid);
 
-  if (sh->active && first_station == PRIMI) {
+  if (simulation_is_active(sid, sh) && first_station == PRIMI) {
     got_first = request_service(sid, mid, sh, PRIMI, first, 0);
   }
-  if (sh->active && first_station == SECONDI) {
+  if (simulation_is_active(sid, sh) && first_station == SECONDI) {
     got_second = request_service(sid, mid, sh, SECONDI, second, 0);
   }
-  if (sh->active && first_station == PRIMI) {
+  if (simulation_is_active(sid, sh) && first_station == PRIMI) {
     got_second = request_service(sid, mid, sh, SECONDI, second, 0);
   }
-  if (sh->active && first_station == SECONDI) {
+  if (simulation_is_active(sid, sh) && first_station == SECONDI) {
     got_first = request_service(sid, mid, sh, PRIMI, first, 0);
   }
-  if (sh->active && coffee) {
+  if (simulation_is_active(sid, sh) && coffee) {
     got_coffee = request_service(sid, mid, sh, COFFEE, coffee_type, 1);
   }
-  if (sh->active && dessert) {
+  if (simulation_is_active(sid, sh) && dessert) {
     got_dessert = request_service(sid, mid, sh, COFFEE, 0, 2);
   }
 
-  if (!sh->active) {
+  if (!simulation_is_active(sid, sh)) {
+    record_unserved(sid, sh);
     shmdt(sh);
     return 0;
   }
   if (!got_first && !got_second) {
-    lock_shared(sid);
-    sh->unserved++;
-    sh->day_unserved++;
-    unlock_shared(sid);
+    record_unserved(sid, sh);
     shmdt(sh);
     return 0;
   }
@@ -116,25 +131,37 @@ int main(void) {
                  .dish = bits,
                  .coffee = got_coffee,
                  .dessert = got_dessert};
-  struct timespec pay_begin, pay_end;
-  clock_gettime(CLOCK_MONOTONIC, &pay_begin);
-
   lock_shared(sid);
+  if (!sh->active) {
+    unlock_shared(sid);
+    record_unserved(sid, sh);
+    shmdt(sh);
+    return 0;
+  }
   sh->queue[3]++;
   unlock_shared(sid);
+  pay.enqueued_ns = monotonic_time_ns();
   if (msgsnd(mid, &pay, sizeof pay - sizeof(long), 0) < 0) {
+    lock_shared(sid);
+    if (sh->queue[3] > 0)
+      sh->queue[3]--;
+    int active = sh->active;
+    unlock_shared(sid);
+    if (!active)
+      record_unserved(sid, sh);
     shmdt(sh);
     return 0;
   }
 
   Reply ack;
   if (msgrcv(mid, &ack, sizeof ack - sizeof(long), (long)getpid(), 0) < 0) {
+    if (!simulation_is_active(sid, sh))
+      record_unserved(sid, sh);
     shmdt(sh);
     return 0;
   }
 
-  clock_gettime(CLOCK_MONOTONIC, &pay_end);
-  double pay_wait_minutes = elapsed_sim_minutes(&sh->cfg, pay_begin, pay_end);
+  double pay_wait_minutes = simulated_minutes(&sh->cfg, ack.queue_wait_ns);
 
   lock_shared(sid);
   sh->wait_minutes[3] += pay_wait_minutes;
@@ -144,7 +171,7 @@ int main(void) {
   unlock_shared(sid);
 
   sem_p(sid, SEM_TABLES);
-  if (sh->active) {
+  if (simulation_is_active(sid, sh)) {
     int dishes = got_first + got_second + got_coffee + got_dessert;
     int ms = dishes * 1000;
     long ns = scale_ms(&sh->cfg, ms);

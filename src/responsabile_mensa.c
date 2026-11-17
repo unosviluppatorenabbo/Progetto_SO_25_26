@@ -1,28 +1,87 @@
 #include "common.h"
 #include <sys/wait.h>
 
-static int shm_id, sem_id, msg_id;
+static int shm_id = -1, sem_id = -1, msg_id = -1;
 static Shared *shared;
 static pid_t children[512];
 static int child_count;
+static volatile sig_atomic_t requested_signal;
+union semun {
+  int val;
+  struct semid_ds *buf;
+  unsigned short *array;
+};
+typedef struct {
+  int served, unserved, distributed[3], workers, pauses;
+  double wait_minutes[4], revenue;
+  long long wait_count[4];
+} StatsSnapshot;
+
+static void handle_shutdown_signal(int signal) { requested_signal = signal; }
+
+static const char *termination_signal_name(void) {
+  return requested_signal == SIGINT ? "SIGINT" : "SIGTERM";
+}
 
 static void cleanup(void) {
-  if (shared && shared != (void *)-1)
+  if (shared && shared != (void *)-1) {
     shmdt(shared);
-  if (shm_id >= 0)
+    shared = NULL;
+  }
+  if (shm_id >= 0) {
     shmctl(shm_id, IPC_RMID, NULL);
-  if (sem_id >= 0)
+    shm_id = -1;
+  }
+  if (sem_id >= 0) {
     semctl(sem_id, 0, IPC_RMID);
-  if (msg_id >= 0)
+    sem_id = -1;
+  }
+  if (msg_id >= 0) {
     msgctl(msg_id, IPC_RMID, NULL);
+    msg_id = -1;
+  }
+}
+static int wait_for_start(void) {
+  struct sembuf op = {SEM_START, -1, 0};
+  while (!requested_signal) {
+    if (semop(sem_id, &op, 1) == 0)
+      return 0;
+    if (errno != EINTR)
+      return -1;
+  }
+  errno = EINTR;
+  return -1;
 }
 static void stop_children(void) {
-  shared->active = 0;
+  if (shared && shared != (void *)-1) {
+    lock_shared(sem_id);
+    shared->active = 0;
+    unlock_shared(sem_id);
+  }
+  for (int i = 0; i < child_count; i++) {
+    sem_v(sem_id, SEM_GATE);
+    sem_v(sem_id, SEM_TABLES);
+    for (int station = 0; station < 4; station++)
+      sem_v(sem_id, SEM_STATION_PRIMI + station);
+  }
   for (int i = 0; i < child_count; i++)
     kill(children[i], SIGTERM);
-  for (int i = 0; i < child_count; i++)
-    waitpid(children[i], NULL, 0);
+  for (int i = 0; i < child_count; i++) {
+    while (waitpid(children[i], NULL, 0) < 0 && errno == EINTR) {
+    }
+  }
   child_count = 0;
+  union semun arg = {.val = 0};
+  semctl(sem_id, SEM_START, SETVAL, arg);
+  semctl(sem_id, SEM_GATE, SETVAL, arg);
+  if (shared && shared != (void *)-1) {
+    arg.val = shared->cfg.tables;
+    semctl(sem_id, SEM_TABLES, SETVAL, arg);
+    for (int station = 0; station < 4; station++) {
+      arg.val = shared->cfg.seats[station];
+      semctl(sem_id, SEM_STATION_PRIMI + station, SETVAL, arg);
+    }
+  }
 }
 static void drain_messages(void) {
   Message msg;
@@ -38,6 +97,21 @@ static void drain_messages(void) {
 }
 static double average(double total, long long count) {
   return count > 0 ? total / count : 0.0;
+}
+static void capture_stats(StatsSnapshot *snapshot) {
+  lock_shared(sem_id);
+  snapshot->served = shared->day_served;
+  snapshot->unserved = shared->day_unserved;
+  memcpy(snapshot->distributed, shared->day_distributed,
+         sizeof snapshot->distributed);
+  snapshot->workers = shared->day_active;
+  snapshot->pauses = shared->day_pauses;
+  memcpy(snapshot->wait_minutes, shared->day_wait_minutes,
+         sizeof snapshot->wait_minutes);
+  memcpy(snapshot->wait_count, shared->day_wait_count,
+         sizeof snapshot->wait_count);
+  snapshot->revenue = shared->day_revenue;
+  unlock_shared(sem_id);
 }
 static int load_config(Config *c, const char *path) {
   FILE *f = fopen(path, "r");
@@ -100,25 +174,55 @@ static int load_config(Config *c, const char *path) {
   }
   fclose(f);
   return c->sim_duration > 0 && c->users > 0 && c->workers >= 4 &&
-                 c->day_minutes > 0 && c->minute_ns > 0 && c->seats[0] > 0 &&
-                 c->seats[1] > 0 && c->seats[2] > 0 && c->seats[3] > 0 &&
-                 c->tables > 0
+                 c->workers + c->users <= 512 && c->day_minutes > 0 &&
+                 c->minute_ns > 0 && c->seats[0] > 0 && c->seats[1] > 0 &&
+                 c->seats[2] > 0 && c->seats[3] > 0 && c->tables > 0
              ? 0
              : -1;
 }
 static int load_menu(Config *c) {
   FILE *f = fopen(MENU_FILE, "r");
-  char line[128], name[32];
+  char line[128], name[96];
   int kind;
   if (!f)
     return -1;
   while (fgets(line, sizeof line, f))
-    if (sscanf(line, "%d %31[^\n]", &kind, name) == 2) {
-      if ((kind == 0 || kind == 1) && c->n_dishes[kind] < MAX_DISHES)
+    if (sscanf(line, "%d %95[^\n]", &kind, name) == 2) {
+      if (kind == 0 && c->n_dishes[0] < MAX_DISHES &&
+          strlen(name) < sizeof c->dishes[0][0]) {
         strcpy(c->dishes[kind][c->n_dishes[kind]++], name);
-      else if (kind == 2 && c->coffee_types < 4)
+      } else if (kind == 1 && c->n_dishes[1] < MAX_DISHES) {
+        char *separator = strchr(name, '|');
+        if (!separator)
+          continue;
+        *separator = '\0';
+        char *second = name;
+        char *side = separator + 1;
+        while (*second == ' ' || *second == '\t')
+          second++;
+        while (*side == ' ' || *side == '\t')
+          side++;
+        size_t second_len = strlen(second);
+        size_t side_len = strlen(side);
+        while (second_len > 0 && (second[second_len - 1] == ' ' ||
+                                  second[second_len - 1] == '\t'))
+          second[--second_len] = '\0';
+        while (side_len > 0 &&
+               (side[side_len - 1] == ' ' || side[side_len - 1] == '\t' ||
+                side[side_len - 1] == '\r' || side[side_len - 1] == '\n'))
+          side[--side_len] = '\0';
+        if (second_len == 0 || side_len == 0 ||
+            second_len >= sizeof c->dishes[1][0] ||
+            side_len >= sizeof c->sides[0])
+          continue;
+        int option = c->n_dishes[1]++;
+        strcpy(c->dishes[1][option], second);
+        strcpy(c->sides[option], side);
+      } else if (kind == 2 && c->coffee_types < 4 &&
+                 strlen(name) < sizeof c->coffees[0])
         strcpy(c->coffees[c->coffee_types++], name);
-      else if (kind == 3 && c->dessert_count < MAX_DISHES)
+      else if (kind == 3 && c->dessert_count < MAX_DISHES &&
+               strlen(name) < sizeof c->desserts[0])
         strcpy(c->desserts[c->dessert_count++], name);
     }
   fclose(f);
@@ -140,70 +244,82 @@ static void launch(const char *exe, const char *arg) {
   }
   children[child_count++] = p;
 }
-static void print_stats(int day, int days) {
+static void print_stats(int day, int days, const StatsSnapshot *before,
+                        int total_leftovers[3]) {
   lock_shared(sem_id);
-  int dt = shared->day_distributed[0] + shared->day_distributed[1] +
-           shared->day_distributed[2];
+  int day_served = shared->day_served - before->served;
+  int day_unserved = shared->day_unserved - before->unserved;
+  int day_distributed[3];
+  for (int k = 0; k < 3; k++)
+    day_distributed[k] = shared->day_distributed[k] - before->distributed[k];
+  int day_dishes = day_distributed[0] + day_distributed[1] + day_distributed[2];
+  int day_active = shared->day_active - before->workers;
+  int day_pauses = shared->day_pauses - before->pauses;
+  double day_revenue = shared->day_revenue - before->revenue;
   int total =
       shared->distributed[0] + shared->distributed[1] + shared->distributed[2];
-  memset(shared->day_leftovers, 0, sizeof shared->day_leftovers);
+  int day_leftovers[3] = {0};
   for (int k = 0; k < 2; k++)
     for (int j = 0; j < shared->cfg.n_dishes[k]; j++)
-      shared->day_leftovers[k] += shared->portions[k][j];
+      day_leftovers[k] += shared->portions[k][j];
   for (int k = 0; k < 3; k++)
-    shared->leftovers[k] += shared->day_leftovers[k];
-  shared->day_unserved +=
-      shared->queue[0] + shared->queue[1] + shared->queue[2] + shared->queue[3];
-  shared->unserved +=
-      shared->queue[0] + shared->queue[1] + shared->queue[2] + shared->queue[3];
+    total_leftovers[k] += day_leftovers[k];
   printf("\nDay %d statistics:\n served=%d unserved=%d\n dishes=%d [first=%d "
-         "second=%d coffee/dessert=%d]\n leftovers=%d\n workers_started=%d \n"
-         "pauses=%d \nrevenue=%.2f\n",
-         day, shared->day_served, shared->day_unserved, dt,
-         shared->day_distributed[0], shared->day_distributed[1],
-         shared->day_distributed[2],
-         shared->day_leftovers[0] + shared->day_leftovers[1],
-         shared->day_active, shared->day_pauses, shared->day_revenue);
+         "second=%d coffee/dessert=%d]\n leftovers=%d\n workers_active=%d \n"
+         "\033[33mpauses=%d\033[0m \nrevenue=%.2f\n",
+         day, day_served, day_unserved, day_dishes, day_distributed[0],
+         day_distributed[1], day_distributed[2],
+         day_leftovers[0] + day_leftovers[1], day_active, day_pauses,
+         day_revenue);
   printf("Leftovers by type:\n first=%d second=%d coffee/dessert=%d;\n "
-         "averages/day:\n served=%.2f unserved=%.2f dishes=%.2f [first=%.2f "
+         "averages/day:\n served=%.2f unserved=%.2f\n dishes=%.2f [first=%.2f "
          "second=%.2f coffee/dessert=%.2f]\n leftovers=%.2f\n",
-         shared->day_leftovers[0], shared->day_leftovers[1],
-         shared->day_leftovers[2], (double)shared->served / day,
-         (double)shared->unserved / day, (double)total / day,
-         (double)shared->distributed[0] / day,
+         day_leftovers[0], day_leftovers[1], day_leftovers[2],
+         (double)shared->served / day, (double)shared->unserved / day,
+         (double)total / day, (double)shared->distributed[0] / day,
          (double)shared->distributed[1] / day,
          (double)shared->distributed[2] / day,
-         (double)(shared->leftovers[0] + shared->leftovers[1]) / day);
-  long long day_wait_count =
-      shared->day_wait_count[0] + shared->day_wait_count[1] +
-      shared->day_wait_count[2] + shared->day_wait_count[3];
-  double day_wait_total =
-      shared->day_wait_minutes[0] + shared->day_wait_minutes[1] +
-      shared->day_wait_minutes[2] + shared->day_wait_minutes[3];
-  printf("Wait avg simulated minutes:\n all %.4f,\n first %.4f,\n second %.4f,\n "
-         "coffee %.4f,\n cashier %.4f\n",
-         average(day_wait_total, day_wait_count),
-         average(shared->day_wait_minutes[0], shared->day_wait_count[0]),
-         average(shared->day_wait_minutes[1], shared->day_wait_count[1]),
-         average(shared->day_wait_minutes[2], shared->day_wait_count[2]),
-         average(shared->day_wait_minutes[3], shared->day_wait_count[3]));
-  printf("Average worker pauses today: %.2f\n",
-         (double)shared->day_pauses /
-             (shared->day_active ? shared->day_active : 1));
-  shared->active_workers = 0;
-  shared->total_workers += shared->day_active;
+         (double)(total_leftovers[0] + total_leftovers[1]) / day);
+  double day_wait_minutes[4];
+  long long day_wait_count[4];
+  long long total_day_wait_count = 0;
+  double total_day_wait_minutes = 0;
+  for (int i = 0; i < 4; i++) {
+    day_wait_minutes[i] = shared->day_wait_minutes[i] - before->wait_minutes[i];
+    day_wait_count[i] = shared->day_wait_count[i] - before->wait_count[i];
+    total_day_wait_minutes += day_wait_minutes[i];
+    total_day_wait_count += day_wait_count[i];
+  }
+  printf(
+      "Wait avg simulated minutes:\n all %.4f,\n first %.4f,\n second %.4f,\n "
+      "coffee %.4f,\n cashier %.4f\n",
+      average(total_day_wait_minutes, total_day_wait_count),
+      average(day_wait_minutes[0], day_wait_count[0]),
+      average(day_wait_minutes[1], day_wait_count[1]),
+      average(day_wait_minutes[2], day_wait_count[2]),
+      average(day_wait_minutes[3], day_wait_count[3]));
+  printf("Average worker pauses today: \033[33m%.2f\033[0m\n",
+         (double)day_pauses / (day_active ? day_active : 1));
   if (day == days)
-    printf(
-        "Totals:\n served=%d unserved=%d dishes=%d [first=%d second=%d "
-        "coffee/dessert=%d],\n leftovers [first=%d second=%d coffee/dessert=%d],\n "
-        "workers:\n started=%d pauses=%d revenue=%.2f avg/day=%.2f\n",
-        shared->served, shared->unserved, total, shared->distributed[0],
-        shared->distributed[1], shared->distributed[2], shared->leftovers[0],
-        shared->leftovers[1], shared->leftovers[2], shared->total_workers,
-        shared->pauses, shared->revenue, shared->revenue / days);
+    printf("Totals:\n served=%d unserved=%d dishes=%d [first=%d second=%d "
+           "coffee/dessert=%d],\n leftovers [first=%d second=%d "
+           "coffee/dessert=%d],\n "
+           "workers_active=%d \033[33mpauses=%d\033[0m revenue=%.2f "
+           "avg/day=%.2f\n",
+           shared->served, shared->unserved, total, shared->distributed[0],
+           shared->distributed[1], shared->distributed[2], total_leftovers[0],
+           total_leftovers[1], total_leftovers[2], shared->total_workers,
+           shared->pauses, shared->revenue, shared->revenue / days);
   unlock_shared(sem_id);
 }
 int main(int argc, char **argv) {
+  struct sigaction action = {.sa_handler = handle_shutdown_signal};
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGINT, &action, NULL) < 0 ||
+      sigaction(SIGTERM, &action, NULL) < 0) {
+    perror("sigaction");
+    return 1;
+  }
   Config cfg = {.sim_duration = 3,
                 .users = 15,
                 .workers = 6,
@@ -219,8 +335,7 @@ int main(int argc, char **argv) {
                 .minute_ns = 10000000,
                 .price = {5, 7, 1}};
   const char *conf = argc > 1 ? argv[1] : "config.txt";
-  if (load_config(&cfg, conf) < 0 || load_menu(&cfg) < 0 ||
-      cfg.workers > cfg.seats[0] + cfg.seats[1] + cfg.seats[2] + cfg.seats[3]) {
+  if (load_config(&cfg, conf) < 0 || load_menu(&cfg) < 0) {
     fprintf(stderr, "Invalid config or menu (check worker/station capacities "
                     "and menu.txt).\n");
     return 1;
@@ -233,6 +348,8 @@ int main(int argc, char **argv) {
   shared = shmat(shm_id, NULL, 0);
   if (shared == (void *)-1) {
     perror("shmat");
+    shared = NULL;
+    cleanup();
     return 1;
   }
   sem_id = semget(ftok(FTOK_PATH, FTOK_SEM), NUM_SEMAFORI, IPC_CREAT | 0666);
@@ -244,16 +361,24 @@ int main(int argc, char **argv) {
   }
   memset(shared, 0, sizeof *shared);
   shared->cfg = cfg;
-  unsigned short values[NUM_SEMAFORI] = {0, 1, (unsigned short)cfg.tables, 0};
-  union semun {
-    int val;
-    struct semid_ds *buf;
-    unsigned short *array;
-  } arg = {.array = values};
-  semctl(sem_id, 0, SETALL, arg);
+  unsigned short values[NUM_SEMAFORI] = {0,
+                                         1,
+                                         (unsigned short)cfg.tables,
+                                         0,
+                                         (unsigned short)cfg.seats[0],
+                                         (unsigned short)cfg.seats[1],
+                                         (unsigned short)cfg.seats[2],
+                                         (unsigned short)cfg.seats[3]};
+  union semun arg = {.array = values};
+  if (semctl(sem_id, 0, SETALL, arg) < 0) {
+    perror("semctl SETALL");
+    cleanup();
+    return 1;
+  }
   const char *termination = "timeout";
   int completed_days = 0;
-  for (int day = 1; day <= cfg.sim_duration; day++) {
+  int total_leftovers[3] = {0};
+  for (int day = 1; day <= cfg.sim_duration && !requested_signal; day++) {
     arg.val = cfg.tables;
     if (semctl(sem_id, SEM_TABLES, SETVAL, arg) < 0) {
       perror("semctl tables");
@@ -262,32 +387,26 @@ int main(int argc, char **argv) {
     }
     lock_shared(sem_id);
     shared->active = 1;
-    shared->day_served = shared->day_unserved = shared->day_revenue = 0;
-    shared->day_active = shared->day_pauses = 0;
-    memset(shared->day_distributed, 0, sizeof shared->day_distributed);
-    memset(shared->day_wait_minutes, 0, sizeof shared->day_wait_minutes);
-    memset(shared->day_wait_count, 0, sizeof shared->day_wait_count);
     memset(shared->queue, 0, sizeof shared->queue);
+    memset(shared->staffed, 0, sizeof shared->staffed);
     for (int k = 0; k < 2; k++)
       for (int d = 0; d < cfg.n_dishes[k]; d++)
         shared->portions[k][d] = cfg.refill[k];
     unlock_shared(sem_id);
+    StatsSnapshot day_start;
+    capture_stats(&day_start);
     int allocation[4] = {1, 1, 1, 1};
     int left = cfg.workers - 4;
     while (left-- > 0) {
       int best = -1;
       for (int s = 0; s < 4; s++)
-        if (allocation[s] < cfg.seats[s] &&
-            (best < 0 || (double)cfg.service_ms[s] / allocation[s] >
-                             (double)cfg.service_ms[best] / allocation[best]))
+        if (best < 0 || (double)cfg.service_ms[s] / allocation[s] >
+                            (double)cfg.service_ms[best] / allocation[best])
           best = s;
       if (best < 0)
         break;
       allocation[best]++;
     }
-    lock_shared(sem_id);
-    memcpy(shared->staffed, allocation, sizeof allocation);
-    unlock_shared(sem_id);
     int started = 0;
     for (int s = 0; s < 4; s++)
       for (int n = 0; n < allocation[s]; n++) {
@@ -300,17 +419,43 @@ int main(int argc, char **argv) {
     for (int u = 0; u < cfg.users; u++)
       launch("./bin/utente", "0");
     started += cfg.users;
-    for (int n = 0; n < started; n++)
-      sem_p(sem_id, SEM_START);
+    int ready = 1;
+    for (int n = 0; n < started; n++) {
+      if (wait_for_start() < 0) {
+        ready = 0;
+        break;
+      }
+    }
+    if (!ready) {
+      if (!requested_signal) {
+        perror("waiting for child startup");
+        termination = "error";
+      } else {
+        termination = termination_signal_name();
+      }
+      stop_children();
+      drain_messages();
+      break;
+    }
     for (int n = 0; n < started; n++)
       sem_v(sem_id, SEM_GATE);
+    if (requested_signal) {
+      termination = termination_signal_name();
+      stop_children();
+      drain_messages();
+      break;
+    }
     printf("Day %d/%d opened (%d workers, %d users).\n", day, cfg.sim_duration,
            cfg.workers, cfg.users);
     int overload = 0;
     for (int minute = 0; minute < cfg.day_minutes; minute++) {
+      if (requested_signal)
+        break;
       long long ns = cfg.minute_ns;
       struct timespec t = {(time_t)(ns / 1000000000), (long)(ns % 1000000000)};
       nanosleep(&t, NULL);
+      if (requested_signal)
+        break;
       if (minute > 0 && minute % 10 == 0) {
         lock_shared(sem_id);
         for (int k = 0; k < 2; k++)
@@ -322,21 +467,30 @@ int main(int argc, char **argv) {
         unlock_shared(sem_id);
       }
     }
+    if (requested_signal) {
+      termination = termination_signal_name();
+      stop_children();
+      drain_messages();
+      break;
+    }
     lock_shared(sem_id);
+    shared->active = 0;
     overload = shared->queue[0] + shared->queue[1] + shared->queue[2] +
                    shared->queue[3] >
                cfg.overload;
     unlock_shared(sem_id);
     stop_children();
     drain_messages();
-    print_stats(day, cfg.sim_duration);
+    print_stats(day, cfg.sim_duration, &day_start, total_leftovers);
     completed_days++;
     if (overload) {
       termination = "overload";
       break;
     }
   }
-  printf("\nFinal termination cause: %s.\n", termination);
+  if (requested_signal)
+    termination = termination_signal_name();
+  printf("\nFinal termination cause: \033[31m%s\033[0m.\n", termination);
   lock_shared(sem_id);
   long long total_count = 0;
   double total_wait = 0;
@@ -344,21 +498,24 @@ int main(int argc, char **argv) {
     total_wait += shared->wait_minutes[i];
     total_count += shared->wait_count[i];
   }
-  printf("Simulation wait averages (simulated minutes): all %.4f;\n first %.4f;\n "
+  printf("Simulation wait averages (simulated minutes):\n all %.4f;\n first "
+         "%.4f;\n "
          "second %.4f;\n coffee %.4f;\n cashier %.4f\n",
          average(total_wait, total_count),
          average(shared->wait_minutes[0], shared->wait_count[0]),
          average(shared->wait_minutes[1], shared->wait_count[1]),
          average(shared->wait_minutes[2], shared->wait_count[2]),
          average(shared->wait_minutes[3], shared->wait_count[3]));
-  printf("Simulation totals:\n served=%d unserved=%d dishes [first=%d second=%d "
-         "coffee/dessert=%d]\n leftovers [first=%d second=%d coffee/dessert=%d] \n"
-         "workers:\n started=%d\n pauses=%d\n revenue=%.2f;\n avg revenue/day=%.2f\n",
-         shared->served, shared->unserved, shared->distributed[0],
-         shared->distributed[1], shared->distributed[2], shared->leftovers[0],
-         shared->leftovers[1], shared->leftovers[2], shared->total_workers,
-         shared->pauses, shared->revenue,
-         shared->revenue / (completed_days ? completed_days : 1));
+  printf(
+      "Simulation totals:\n served=%d unserved=%d\n dishes [first=%d second=%d "
+      "coffee/dessert=%d]\n leftovers [first=%d second=%d coffee/dessert=%d] \n"
+      "workers_active=%d\n pauses=\033[33m%d\033[0m\n revenue=%.2f;\n avg "
+      "revenue/day=%.2f\n",
+      shared->served, shared->unserved, shared->distributed[0],
+      shared->distributed[1], shared->distributed[2], total_leftovers[0],
+      total_leftovers[1], total_leftovers[2], shared->total_workers,
+      shared->pauses, shared->revenue,
+      shared->revenue / (completed_days ? completed_days : 1));
   unlock_shared(sem_id);
   cleanup();
   return 0;
