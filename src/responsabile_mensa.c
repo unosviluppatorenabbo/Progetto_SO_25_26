@@ -3,6 +3,7 @@
 
 static int shm_id = -1, sem_id = -1, msg_id = -1;
 static Shared *shared;
+static FILE *stats_csv;
 static pid_t children[512];
 static int child_count;
 static volatile sig_atomic_t requested_signal;
@@ -16,6 +17,10 @@ typedef struct {
   double wait_minutes[4], revenue;
   long long wait_count[4];
 } StatsSnapshot;
+typedef struct {
+  const char *name;
+  double value;
+} CsvMetric;
 
 static void handle_shutdown_signal(int signal) { requested_signal = signal; }
 
@@ -24,6 +29,11 @@ static const char *termination_signal_name(void) {
 }
 
 static void cleanup(void) {
+  if (stats_csv) {
+    if (fclose(stats_csv) == EOF)
+      perror("closing output.csv");
+    stats_csv = NULL;
+  }
   if (shared && shared != (void *)-1) {
     shmdt(shared);
     shared = NULL;
@@ -43,11 +53,32 @@ static void cleanup(void) {
 }
 static int wait_for_start(void) {
   struct sembuf op = {SEM_START, -1, 0};
+  struct timespec timeout = {.tv_sec = 0, .tv_nsec = 100000000};
   while (!requested_signal) {
-    if (semop(sem_id, &op, 1) == 0)
+    if (semtimedop(sem_id, &op, 1, &timeout) == 0)
       return 0;
-    if (errno != EINTR)
+    if (errno == EINTR)
+      continue;
+    if (errno != EAGAIN)
       return -1;
+
+    for (int i = 0; i < child_count; i++) {
+      if (children[i] <= 0)
+        continue;
+      int status;
+      pid_t result = waitpid(children[i], &status, WNOHANG);
+      if (result == children[i]) {
+        children[i] = 0;
+        errno = ECHILD;
+        return -1;
+      }
+      if (result < 0 && errno == ECHILD) {
+        children[i] = 0;
+        return -1;
+      }
+      if (result < 0 && errno != EINTR)
+        return -1;
+    }
   }
   errno = EINTR;
   return -1;
@@ -65,8 +96,11 @@ static void stop_children(void) {
       sem_v(sem_id, SEM_STATION_PRIMI + station);
   }
   for (int i = 0; i < child_count; i++)
-    kill(children[i], SIGTERM);
+    if (children[i] > 0)
+      kill(children[i], SIGTERM);
   for (int i = 0; i < child_count; i++) {
+    if (children[i] <= 0)
+      continue;
     while (waitpid(children[i], NULL, 0) < 0 && errno == EINTR) {
     }
   }
@@ -97,6 +131,17 @@ static void drain_messages(void) {
 }
 static double average(double total, long long count) {
   return count > 0 ? total / count : 0.0;
+}
+static int csv_write_group(const char *record_type, int day,
+                           const char *termination, const CsvMetric *metrics,
+                           size_t count, int add_day_separator) {
+  for (size_t i = 0; i < count; i++)
+    if (fprintf(stats_csv, "%s,%d,%s,%s,%.10g\n", record_type, day, termination,
+                metrics[i].name, metrics[i].value) < 0)
+      return -1;
+  if (add_day_separator && fprintf(stats_csv, "DAY_END,%d,,,\n\n", day) < 0)
+    return -1;
+  return fflush(stats_csv) == EOF ? -1 : 0;
 }
 static void capture_stats(StatsSnapshot *snapshot) {
   lock_shared(sem_id);
@@ -271,15 +316,20 @@ static void print_stats(int day, int days, const StatsSnapshot *before,
          day_distributed[1], day_distributed[2],
          day_leftovers[0] + day_leftovers[1], day_active, day_pauses,
          day_revenue);
-  printf("Leftovers by type:\n first=%d second=%d coffee/dessert=%d;\n "
-         "averages/day:\n served=%.2f unserved=%.2f\n dishes=%.2f [first=%.2f "
-         "second=%.2f coffee/dessert=%.2f]\n leftovers=%.2f\n",
-         day_leftovers[0], day_leftovers[1], day_leftovers[2],
-         (double)shared->served / day, (double)shared->unserved / day,
-         (double)total / day, (double)shared->distributed[0] / day,
-         (double)shared->distributed[1] / day,
-         (double)shared->distributed[2] / day,
-         (double)(total_leftovers[0] + total_leftovers[1]) / day);
+  printf(
+      "Leftovers by type:\n first=%d second=%d coffee/dessert=%d;\n "
+      "averages/day:\n served=%.2f unserved=%.2f\n dishes=%.2f [first=%.2f "
+      "second=%.2f coffee/dessert=%.2f]\n leftovers/day=%.2f [first=%.2f "
+      "second=%.2f coffee/dessert=%.2f]\n",
+      day_leftovers[0], day_leftovers[1], day_leftovers[2],
+      (double)shared->served / day, (double)shared->unserved / day,
+      (double)total / day, (double)shared->distributed[0] / day,
+      (double)shared->distributed[1] / day,
+      (double)shared->distributed[2] / day,
+      (double)(total_leftovers[0] + total_leftovers[1] + total_leftovers[2]) /
+          day,
+      (double)total_leftovers[0] / day, (double)total_leftovers[1] / day,
+      (double)total_leftovers[2] / day);
   double day_wait_minutes[4];
   long long day_wait_count[4];
   long long total_day_wait_count = 0;
@@ -289,6 +339,53 @@ static void print_stats(int day, int days, const StatsSnapshot *before,
     day_wait_count[i] = shared->day_wait_count[i] - before->wait_count[i];
     total_day_wait_minutes += day_wait_minutes[i];
     total_day_wait_count += day_wait_count[i];
+  }
+  if (stats_csv) {
+    CsvMetric metrics[] = {
+        {"served", day_served},
+        {"unserved", day_unserved},
+        {"dishes_total", day_dishes},
+        {"first_distributed", day_distributed[0]},
+        {"second_distributed", day_distributed[1]},
+        {"coffee_dessert_distributed", day_distributed[2]},
+        {"leftovers_total",
+         day_leftovers[0] + day_leftovers[1] + day_leftovers[2]},
+        {"leftovers_first", day_leftovers[0]},
+        {"leftovers_second", day_leftovers[1]},
+        {"leftovers_coffee_dessert", day_leftovers[2]},
+        {"served_avg_per_day", (double)shared->served / day},
+        {"unserved_avg_per_day", (double)shared->unserved / day},
+        {"dishes_avg_per_day", (double)total / day},
+        {"first_dishes_avg_per_day", (double)shared->distributed[0] / day},
+        {"second_dishes_avg_per_day", (double)shared->distributed[1] / day},
+        {"coffee_dessert_avg_per_day", (double)shared->distributed[2] / day},
+        {"leftovers_avg_per_day",
+         (double)(total_leftovers[0] + total_leftovers[1] +
+                  total_leftovers[2]) /
+             day},
+        {"leftovers_first_avg_per_day", (double)total_leftovers[0] / day},
+        {"leftovers_second_avg_per_day", (double)total_leftovers[1] / day},
+        {"leftovers_coffee_dessert_avg_per_day",
+         (double)total_leftovers[2] / day},
+        {"wait_avg_sim_minutes",
+         average(total_day_wait_minutes, total_day_wait_count)},
+        {"wait_first_sim_minutes",
+         average(day_wait_minutes[0], day_wait_count[0])},
+        {"wait_second_sim_minutes",
+         average(day_wait_minutes[1], day_wait_count[1])},
+        {"wait_coffee_sim_minutes",
+         average(day_wait_minutes[2], day_wait_count[2])},
+        {"wait_cashier_sim_minutes",
+         average(day_wait_minutes[3], day_wait_count[3])},
+        {"workers_active", day_active},
+        {"pauses", day_pauses},
+        {"avg_pauses_per_worker",
+         (double)day_pauses / (day_active ? day_active : 1)},
+        {"revenue", day_revenue},
+        {"revenue_avg_per_day", (double)shared->revenue / day}};
+    if (csv_write_group("DAY", day, "", metrics,
+                        sizeof metrics / sizeof metrics[0], 1) < 0)
+      perror("writing output.csv");
   }
   printf(
       "Wait avg simulated minutes:\n all %.4f,\n first %.4f,\n second %.4f,\n "
@@ -311,6 +408,12 @@ static void print_stats(int day, int days, const StatsSnapshot *before,
            total_leftovers[1], total_leftovers[2], shared->total_workers,
            shared->pauses, shared->revenue, shared->revenue / days);
   unlock_shared(sem_id);
+}
+static void report_interrupted_day(int day, const StatsSnapshot *day_start,
+                                   int total_leftovers[3]) {
+  stop_children();
+  drain_messages();
+  print_stats(day, 0, day_start, total_leftovers);
 }
 int main(int argc, char **argv) {
   struct sigaction action = {.sa_handler = handle_shutdown_signal};
@@ -338,6 +441,17 @@ int main(int argc, char **argv) {
   if (load_config(&cfg, conf) < 0 || load_menu(&cfg) < 0) {
     fprintf(stderr, "Invalid config or menu (check worker/station capacities "
                     "and menu.txt).\n");
+    return 1;
+  }
+  stats_csv = fopen("output.csv", "w");
+  if (!stats_csv) {
+    perror("output.csv");
+    return 1;
+  }
+  if (fputs("record_type,day,termination_cause,metric,value\n", stats_csv) ==
+      EOF) {
+    perror("writing output.csv header");
+    cleanup();
     return 1;
   }
   shm_id = shmget(ftok(FTOK_PATH, FTOK_SHM), sizeof(Shared), IPC_CREAT | 0666);
@@ -430,19 +544,21 @@ int main(int argc, char **argv) {
       if (!requested_signal) {
         perror("waiting for child startup");
         termination = "error";
+        stop_children();
+        drain_messages();
       } else {
         termination = termination_signal_name();
+        report_interrupted_day(day, &day_start, total_leftovers);
+        completed_days++;
       }
-      stop_children();
-      drain_messages();
       break;
     }
     for (int n = 0; n < started; n++)
       sem_v(sem_id, SEM_GATE);
     if (requested_signal) {
       termination = termination_signal_name();
-      stop_children();
-      drain_messages();
+      report_interrupted_day(day, &day_start, total_leftovers);
+      completed_days++;
       break;
     }
     printf("Day %d/%d opened (%d workers, %d users).\n", day, cfg.sim_duration,
@@ -469,8 +585,8 @@ int main(int argc, char **argv) {
     }
     if (requested_signal) {
       termination = termination_signal_name();
-      stop_children();
-      drain_messages();
+      report_interrupted_day(day, &day_start, total_leftovers);
+      completed_days++;
       break;
     }
     lock_shared(sem_id);
@@ -497,6 +613,58 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 4; i++) {
     total_wait += shared->wait_minutes[i];
     total_count += shared->wait_count[i];
+  }
+  int total_dishes =
+      shared->distributed[0] + shared->distributed[1] + shared->distributed[2];
+  int total_leftover_count =
+      total_leftovers[0] + total_leftovers[1] + total_leftovers[2];
+  int average_days = completed_days ? completed_days : 1;
+  if (stats_csv) {
+    CsvMetric metrics[] = {
+        {"served", shared->served},
+        {"unserved", shared->unserved},
+        {"dishes_total", total_dishes},
+        {"first_distributed", shared->distributed[0]},
+        {"second_distributed", shared->distributed[1]},
+        {"coffee_dessert_distributed", shared->distributed[2]},
+        {"leftovers_total", total_leftover_count},
+        {"leftovers_first", total_leftovers[0]},
+        {"leftovers_second", total_leftovers[1]},
+        {"leftovers_coffee_dessert", total_leftovers[2]},
+        {"served_avg_per_day", (double)shared->served / average_days},
+        {"unserved_avg_per_day", (double)shared->unserved / average_days},
+        {"dishes_avg_per_day", (double)total_dishes / average_days},
+        {"first_dishes_avg_per_day",
+         (double)shared->distributed[0] / average_days},
+        {"second_dishes_avg_per_day",
+         (double)shared->distributed[1] / average_days},
+        {"coffee_dessert_avg_per_day",
+         (double)shared->distributed[2] / average_days},
+        {"leftovers_avg_per_day", (double)total_leftover_count / average_days},
+        {"leftovers_first_avg_per_day",
+         (double)total_leftovers[0] / average_days},
+        {"leftovers_second_avg_per_day",
+         (double)total_leftovers[1] / average_days},
+        {"leftovers_coffee_dessert_avg_per_day",
+         (double)total_leftovers[2] / average_days},
+        {"wait_avg_sim_minutes", average(total_wait, total_count)},
+        {"wait_first_sim_minutes",
+         average(shared->wait_minutes[0], shared->wait_count[0])},
+        {"wait_second_sim_minutes",
+         average(shared->wait_minutes[1], shared->wait_count[1])},
+        {"wait_coffee_sim_minutes",
+         average(shared->wait_minutes[2], shared->wait_count[2])},
+        {"wait_cashier_sim_minutes",
+         average(shared->wait_minutes[3], shared->wait_count[3])},
+        {"workers_active", shared->total_workers},
+        {"pauses", shared->pauses},
+        {"avg_pauses_per_worker",
+         average(shared->pauses, shared->total_workers)},
+        {"revenue", shared->revenue},
+        {"revenue_avg_per_day", shared->revenue / average_days}};
+    if (csv_write_group("TOTAL", completed_days, termination, metrics,
+                        sizeof metrics / sizeof metrics[0], 0) < 0)
+      perror("writing output.csv totals");
   }
   printf("Simulation wait averages (simulated minutes):\n all %.4f;\n first "
          "%.4f;\n "

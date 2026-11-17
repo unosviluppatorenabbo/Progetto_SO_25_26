@@ -107,12 +107,6 @@ int main(void) {
   if (simulation_is_active(sid, sh) && first_station == SECONDI) {
     got_first = request_service(sid, mid, sh, PRIMI, first, 0);
   }
-  if (simulation_is_active(sid, sh) && coffee) {
-    got_coffee = request_service(sid, mid, sh, COFFEE, coffee_type, 1);
-  }
-  if (simulation_is_active(sid, sh) && dessert) {
-    got_dessert = request_service(sid, mid, sh, COFFEE, 0, 2);
-  }
 
   if (!simulation_is_active(sid, sh)) {
     record_unserved(sid, sh);
@@ -123,6 +117,13 @@ int main(void) {
     record_unserved(sid, sh);
     shmdt(sh);
     return 0;
+  }
+
+  if (simulation_is_active(sid, sh) && coffee) {
+    got_coffee = request_service(sid, mid, sh, COFFEE, coffee_type, 1);
+  }
+  if (simulation_is_active(sid, sh) && dessert) {
+    got_dessert = request_service(sid, mid, sh, COFFEE, 0, 2);
   }
 
   int bits = (got_first ? 1 : 0) | (got_second ? 2 : 0);
