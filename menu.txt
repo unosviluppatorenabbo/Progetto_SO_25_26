@@ -1,10 +1,11 @@
 # 0 = first course, 1 = second course
+# Write each second course as: main course | side dish
 0 Pasta al pomodoro
 0 Risotto ai funghi
 0 Lasagne
-1 Pollo arrosto
-1 Parmigiana
-1 Pesce al forno
+1 Pollo arrosto | Patate al forno
+1 Parmigiana | Insalata mista
+1 Pesce al forno | Verdure grigliate
 2 Normale
 2 Macchiato
 2 Decaffeinato
