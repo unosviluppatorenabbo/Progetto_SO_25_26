@@ -27,10 +27,10 @@ start: $(BIN_DIR)/responsabile_mensa
 	./$(BIN_DIR)/responsabile_mensa
 
 timeout: $(TARGETS)
-	./$(BIN_DIR)/responsabile_mensa "config timeout.conf"
+	./$(BIN_DIR)/responsabile_mensa "config_timeout.conf"
 
 overload: $(TARGETS)
-	./$(BIN_DIR)/responsabile_mensa "config overload.conf"
+	./$(BIN_DIR)/responsabile_mensa "config_overload.conf"
 
 clean:
 	rm -f $(TARGETS)
