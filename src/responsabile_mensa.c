@@ -7,54 +7,70 @@ static FILE *stats_csv;
 static pid_t children[512];
 static int child_count;
 static volatile sig_atomic_t requested_signal;
-union semun {
+
+union semun
+{
   int val;
   struct semid_ds *buf;
   unsigned short *array;
 };
-typedef struct {
+
+typedef struct
+{
   int served, unserved, distributed[3], workers, pauses;
   double wait_minutes[4], revenue;
   long long wait_count[4];
 } StatsSnapshot;
-typedef struct {
+
+typedef struct
+{
   const char *name;
   double value;
 } CsvMetric;
 
 static void handle_shutdown_signal(int signal) { requested_signal = signal; }
 
-static const char *termination_signal_name(void) {
+static const char *termination_signal_name(void)
+{
   return requested_signal == SIGINT ? "SIGINT" : "SIGTERM";
 }
 
-static void cleanup(void) {
-  if (stats_csv) {
+static void cleanup(void)
+{
+  if (stats_csv)
+  {
     if (fclose(stats_csv) == EOF)
       perror("closing output.csv");
     stats_csv = NULL;
   }
-  if (shared && shared != (void *)-1) {
+  if (shared && shared != (void *)-1)
+  {
     shmdt(shared);
     shared = NULL;
   }
-  if (shm_id >= 0) {
+  if (shm_id >= 0)
+  {
     shmctl(shm_id, IPC_RMID, NULL);
     shm_id = -1;
   }
-  if (sem_id >= 0) {
+  if (sem_id >= 0)
+  {
     semctl(sem_id, 0, IPC_RMID);
     sem_id = -1;
   }
-  if (msg_id >= 0) {
+  if (msg_id >= 0)
+  {
     msgctl(msg_id, IPC_RMID, NULL);
     msg_id = -1;
   }
 }
-static int wait_for_start(void) {
+
+static int wait_for_start(void)
+{
   struct sembuf op = {SEM_START, -1, 0};
   struct timespec timeout = {.tv_sec = 0, .tv_nsec = 100000000};
-  while (!requested_signal) {
+  while (!requested_signal)
+  {
     if (semtimedop(sem_id, &op, 1, &timeout) == 0)
       return 0;
     if (errno == EINTR)
@@ -62,17 +78,20 @@ static int wait_for_start(void) {
     if (errno != EAGAIN)
       return -1;
 
-    for (int i = 0; i < child_count; i++) {
+    for (int i = 0; i < child_count; i++)
+    {
       if (children[i] <= 0)
         continue;
       int status;
       pid_t result = waitpid(children[i], &status, WNOHANG);
-      if (result == children[i]) {
+      if (result == children[i])
+      {
         children[i] = 0;
         errno = ECHILD;
         return -1;
       }
-      if (result < 0 && errno == ECHILD) {
+      if (result < 0 && errno == ECHILD)
+      {
         children[i] = 0;
         return -1;
       }
@@ -83,13 +102,21 @@ static int wait_for_start(void) {
   errno = EINTR;
   return -1;
 }
-static void stop_children(void) {
-  if (shared && shared != (void *)-1) {
+
+static void stop_children(void)
+{
+  int extra_users = 0;
+  if (shared && shared != (void *)-1)
+  {
     lock_shared(sem_id);
     shared->active = 0;
+    shared->cassa_blocked = 0;
+    extra_users = shared->dynamic_users_added;
+    shared->dynamic_users_added = 0;
     unlock_shared(sem_id);
   }
-  for (int i = 0; i < child_count; i++) {
+  for (int i = 0; i < child_count + extra_users; i++)
+  {
     sem_v(sem_id, SEM_GATE);
     sem_v(sem_id, SEM_TABLES);
     for (int station = 0; station < 4; station++)
@@ -98,28 +125,39 @@ static void stop_children(void) {
   for (int i = 0; i < child_count; i++)
     if (children[i] > 0)
       kill(children[i], SIGTERM);
-  for (int i = 0; i < child_count; i++) {
+  for (int i = 0; i < child_count; i++)
+  {
     if (children[i] <= 0)
       continue;
-    while (waitpid(children[i], NULL, 0) < 0 && errno == EINTR) {
+    while (waitpid(children[i], NULL, 0) < 0 && errno == EINTR)
+    {
     }
+  }
+  // Raccoglie eventuali processi utente aggiunti a runtime
+  while (waitpid(-1, NULL, WNOHANG) > 0)
+  {
   }
   child_count = 0;
   union semun arg = {.val = 0};
   semctl(sem_id, SEM_START, SETVAL, arg);
   semctl(sem_id, SEM_GATE, SETVAL, arg);
-  if (shared && shared != (void *)-1) {
+  if (shared && shared != (void *)-1)
+  {
     arg.val = shared->cfg.tables;
     semctl(sem_id, SEM_TABLES, SETVAL, arg);
-    for (int station = 0; station < 4; station++) {
+    for (int station = 0; station < 4; station++)
+    {
       arg.val = shared->cfg.seats[station];
       semctl(sem_id, SEM_STATION_PRIMI + station, SETVAL, arg);
     }
   }
 }
-static void drain_messages(void) {
+
+static void drain_messages(void)
+{
   Message msg;
-  while (1) {
+  while (1)
+  {
     if (msgrcv(msg_id, &msg, sizeof msg - sizeof(long), 0, IPC_NOWAIT) >= 0)
       continue;
     if (errno == EINTR)
@@ -129,12 +167,16 @@ static void drain_messages(void) {
     break;
   }
 }
-static double average(double total, long long count) {
+
+static double average(double total, long long count)
+{
   return count > 0 ? total / count : 0.0;
 }
+
 static int csv_write_group(const char *record_type, int day,
                            const char *termination, const CsvMetric *metrics,
-                           size_t count, int add_day_separator) {
+                           size_t count, int add_day_separator)
+{
   for (size_t i = 0; i < count; i++)
     if (fprintf(stats_csv, "%s,%d,%s,%s,%.10g\n", record_type, day, termination,
                 metrics[i].name, metrics[i].value) < 0)
@@ -143,7 +185,9 @@ static int csv_write_group(const char *record_type, int day,
     return -1;
   return fflush(stats_csv) == EOF ? -1 : 0;
 }
-static void capture_stats(StatsSnapshot *snapshot) {
+
+static void capture_stats(StatsSnapshot *snapshot)
+{
   lock_shared(sem_id);
   snapshot->served = shared->day_served;
   snapshot->unserved = shared->day_unserved;
@@ -158,12 +202,15 @@ static void capture_stats(StatsSnapshot *snapshot) {
   snapshot->revenue = shared->day_revenue;
   unlock_shared(sem_id);
 }
-static int load_config(Config *c, const char *path) {
+
+static int load_config(Config *c, const char *path)
+{
   FILE *f = fopen(path, "r");
   char line[256];
   if (!f)
     return -1;
-  while (fgets(line, sizeof line, f)) {
+  while (fgets(line, sizeof line, f))
+  {
     char key[80];
     int v;
     if (sscanf(line, "%79[^=]=%d", key, &v) != 2)
@@ -216,6 +263,12 @@ static int load_config(Config *c, const char *path) {
       c->price[1] = v;
     else if (!strcmp(key, "PRICE_COFFEE"))
       c->price[2] = v;
+    else if (!strcmp(key, "STOP_DURATION"))
+      c->stop_duration = v;
+    else if (!strcmp(key, "TICKET_DISCOUNT"))
+      c->ticket_discount = v;
+    else if (!strcmp(key, "MAX_USERS_PER_GROUP"))
+      c->max_users_per_group = v;
   }
   fclose(f);
   return c->sim_duration > 0 && c->users > 0 && c->workers >= 4 &&
@@ -225,18 +278,24 @@ static int load_config(Config *c, const char *path) {
              ? 0
              : -1;
 }
-static int load_menu(Config *c) {
+
+static int load_menu(Config *c)
+{
   FILE *f = fopen(MENU_FILE, "r");
   char line[128], name[96];
   int kind;
   if (!f)
     return -1;
   while (fgets(line, sizeof line, f))
-    if (sscanf(line, "%d %95[^\n]", &kind, name) == 2) {
+    if (sscanf(line, "%d %95[^\n]", &kind, name) == 2)
+    {
       if (kind == 0 && c->n_dishes[0] < MAX_DISHES &&
-          strlen(name) < sizeof c->dishes[0][0]) {
+          strlen(name) < sizeof c->dishes[0][0])
+      {
         strcpy(c->dishes[kind][c->n_dishes[kind]++], name);
-      } else if (kind == 1 && c->n_dishes[1] < MAX_DISHES) {
+      }
+      else if (kind == 1 && c->n_dishes[1] < MAX_DISHES)
+      {
         char *separator = strchr(name, '|');
         if (!separator)
           continue;
@@ -263,8 +322,9 @@ static int load_menu(Config *c) {
         int option = c->n_dishes[1]++;
         strcpy(c->dishes[1][option], second);
         strcpy(c->sides[option], side);
-      } else if (kind == 2 && c->coffee_types < 4 &&
-                 strlen(name) < sizeof c->coffees[0])
+      }
+      else if (kind == 2 && c->coffee_types < 4 &&
+               strlen(name) < sizeof c->coffees[0])
         strcpy(c->coffees[c->coffee_types++], name);
       else if (kind == 3 && c->dessert_count < MAX_DISHES &&
                strlen(name) < sizeof c->desserts[0])
@@ -276,21 +336,42 @@ static int load_menu(Config *c) {
              ? 0
              : -1;
 }
-static void launch(const char *exe, const char *arg) {
+
+static void launch(const char *exe, const char *arg)
+{
   pid_t p = fork();
-  if (p == 0) {
-    execl(exe, exe, arg, (char *)NULL);
-    perror("exec");
+  if (p == 0)
+  {
+    char *args[] = {(char *)exe, (char *)arg, NULL};
+    extern char **environ;
+    execve(exe, args, environ);
+    perror("execve");
     _exit(127);
   }
-  if (p < 0 || child_count >= 512) {
+  if (p < 0 || child_count >= 512)
+  {
     perror("fork");
     exit(EXIT_FAILURE);
   }
   children[child_count++] = p;
 }
+
+// Calcola l'intervallo casuale di refill +-20% intorno ad AVG_REFILL_TIME
+static int next_refill_interval(int avg_refill_minutes, unsigned int *seed)
+{
+  if (avg_refill_minutes <= 1)
+    return 1;
+  int span = avg_refill_minutes * 20 / 100;
+
+  if (span == 0)
+    span = 1;
+  int delta = (int)(rand_r(seed) % (2 * span + 1)) - span;
+  int val = avg_refill_minutes + delta;
+  return val < 1 ? 1 : val;
+}
 static void print_stats(int day, int days, const StatsSnapshot *before,
-                        int total_leftovers[3]) {
+                        int total_leftovers[3])
+{
   lock_shared(sem_id);
   int day_served = shared->day_served - before->served;
   int day_unserved = shared->day_unserved - before->unserved;
@@ -334,13 +415,15 @@ static void print_stats(int day, int days, const StatsSnapshot *before,
   long long day_wait_count[4];
   long long total_day_wait_count = 0;
   double total_day_wait_minutes = 0;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 4; i++)
+  {
     day_wait_minutes[i] = shared->day_wait_minutes[i] - before->wait_minutes[i];
     day_wait_count[i] = shared->day_wait_count[i] - before->wait_count[i];
     total_day_wait_minutes += day_wait_minutes[i];
     total_day_wait_count += day_wait_count[i];
   }
-  if (stats_csv) {
+  if (stats_csv)
+  {
     CsvMetric metrics[] = {
         {"served", day_served},
         {"unserved", day_unserved},
@@ -410,19 +493,23 @@ static void print_stats(int day, int days, const StatsSnapshot *before,
   unlock_shared(sem_id);
 }
 static void report_interrupted_day(int day, const StatsSnapshot *day_start,
-                                   int total_leftovers[3]) {
+                                   int total_leftovers[3])
+{
   stop_children();
   drain_messages();
   print_stats(day, 0, day_start, total_leftovers);
 }
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
   struct sigaction action = {.sa_handler = handle_shutdown_signal};
   sigemptyset(&action.sa_mask);
   if (sigaction(SIGINT, &action, NULL) < 0 ||
-      sigaction(SIGTERM, &action, NULL) < 0) {
+      sigaction(SIGTERM, &action, NULL) < 0)
+  {
     perror("sigaction");
     return 1;
   }
+  unsigned int seed = (unsigned int)getpid() ^ (unsigned int)time(NULL);
   Config cfg = {.sim_duration = 3,
                 .users = 15,
                 .workers = 6,
@@ -436,31 +523,39 @@ int main(int argc, char **argv) {
                 .overload = 20,
                 .day_minutes = 60,
                 .minute_ns = 10000000,
-                .price = {5, 7, 1}};
+                .price = {5, 7, 1},
+                .stop_duration = 5,
+                .ticket_discount = 20,
+                .max_users_per_group = 4};
   const char *conf = argc > 1 ? argv[1] : "config.txt";
-  if (load_config(&cfg, conf) < 0 || load_menu(&cfg) < 0) {
+  if (load_config(&cfg, conf) < 0 || load_menu(&cfg) < 0)
+  {
     fprintf(stderr, "Invalid config or menu (check worker/station capacities "
                     "and menu.txt).\n");
     return 1;
   }
   stats_csv = fopen("output.csv", "w");
-  if (!stats_csv) {
+  if (!stats_csv)
+  {
     perror("output.csv");
     return 1;
   }
   if (fputs("record_type,day,termination_cause,metric,value\n", stats_csv) ==
-      EOF) {
+      EOF)
+  {
     perror("writing output.csv header");
     cleanup();
     return 1;
   }
   shm_id = shmget(ftok(FTOK_PATH, FTOK_SHM), sizeof(Shared), IPC_CREAT | 0666);
-  if (shm_id < 0) {
+  if (shm_id < 0)
+  {
     perror("shmget");
     return 1;
   }
   shared = shmat(shm_id, NULL, 0);
-  if (shared == (void *)-1) {
+  if (shared == (void *)-1)
+  {
     perror("shmat");
     shared = NULL;
     cleanup();
@@ -468,7 +563,8 @@ int main(int argc, char **argv) {
   }
   sem_id = semget(ftok(FTOK_PATH, FTOK_SEM), NUM_SEMAFORI, IPC_CREAT | 0666);
   msg_id = msgget(ftok(FTOK_PATH, FTOK_MSG), IPC_CREAT | 0666);
-  if (sem_id < 0 || msg_id < 0) {
+  if (sem_id < 0 || msg_id < 0)
+  {
     perror("IPC create");
     cleanup();
     return 1;
@@ -484,7 +580,8 @@ int main(int argc, char **argv) {
                                          (unsigned short)cfg.seats[2],
                                          (unsigned short)cfg.seats[3]};
   union semun arg = {.array = values};
-  if (semctl(sem_id, 0, SETALL, arg) < 0) {
+  if (semctl(sem_id, 0, SETALL, arg) < 0)
+  {
     perror("semctl SETALL");
     cleanup();
     return 1;
@@ -492,15 +589,19 @@ int main(int argc, char **argv) {
   const char *termination = "timeout";
   int completed_days = 0;
   int total_leftovers[3] = {0};
-  for (int day = 1; day <= cfg.sim_duration && !requested_signal; day++) {
+  for (int day = 1; day <= cfg.sim_duration && !requested_signal; day++)
+  {
     arg.val = cfg.tables;
-    if (semctl(sem_id, SEM_TABLES, SETVAL, arg) < 0) {
+    if (semctl(sem_id, SEM_TABLES, SETVAL, arg) < 0)
+    {
       perror("semctl tables");
       cleanup();
       return 1;
     }
     lock_shared(sem_id);
     shared->active = 1;
+    shared->cassa_blocked = 0;
+    shared->dynamic_users_added = 0;
     memset(shared->queue, 0, sizeof shared->queue);
     memset(shared->staffed, 0, sizeof shared->staffed);
     for (int k = 0; k < 2; k++)
@@ -511,7 +612,8 @@ int main(int argc, char **argv) {
     capture_stats(&day_start);
     int allocation[4] = {1, 1, 1, 1};
     int left = cfg.workers - 4;
-    while (left-- > 0) {
+    while (left-- > 0)
+    {
       int best = -1;
       for (int s = 0; s < 4; s++)
         if (best < 0 || (double)cfg.service_ms[s] / allocation[s] >
@@ -523,7 +625,8 @@ int main(int argc, char **argv) {
     }
     int started = 0;
     for (int s = 0; s < 4; s++)
-      for (int n = 0; n < allocation[s]; n++) {
+      for (int n = 0; n < allocation[s]; n++)
+      {
         char a[8];
         snprintf(a, sizeof a, "%d", s + 1);
         launch(s == 3 ? "./bin/operatore_cassa" : "./bin/operatore",
@@ -534,19 +637,25 @@ int main(int argc, char **argv) {
       launch("./bin/utente", "0");
     started += cfg.users;
     int ready = 1;
-    for (int n = 0; n < started; n++) {
-      if (wait_for_start() < 0) {
+    for (int n = 0; n < started; n++)
+    {
+      if (wait_for_start() < 0)
+      {
         ready = 0;
         break;
       }
     }
-    if (!ready) {
-      if (!requested_signal) {
+    if (!ready)
+    {
+      if (!requested_signal)
+      {
         perror("waiting for child startup");
         termination = "error";
         stop_children();
         drain_messages();
-      } else {
+      }
+      else
+      {
         termination = termination_signal_name();
         report_interrupted_day(day, &day_start, total_leftovers);
         completed_days++;
@@ -555,7 +664,8 @@ int main(int argc, char **argv) {
     }
     for (int n = 0; n < started; n++)
       sem_v(sem_id, SEM_GATE);
-    if (requested_signal) {
+    if (requested_signal)
+    {
       termination = termination_signal_name();
       report_interrupted_day(day, &day_start, total_leftovers);
       completed_days++;
@@ -564,7 +674,9 @@ int main(int argc, char **argv) {
     printf("Day %d/%d opened (%d workers, %d users).\n", day, cfg.sim_duration,
            cfg.workers, cfg.users);
     int overload = 0;
-    for (int minute = 0; minute < cfg.day_minutes; minute++) {
+    int next_refill = next_refill_interval(cfg.refill_minutes, &seed);
+    for (int minute = 0; minute < cfg.day_minutes; minute++)
+    {
       if (requested_signal)
         break;
       long long ns = cfg.minute_ns;
@@ -572,18 +684,22 @@ int main(int argc, char **argv) {
       nanosleep(&t, NULL);
       if (requested_signal)
         break;
-      if (minute > 0 && minute % 10 == 0) {
+      if (minute > 0 && minute >= next_refill)
+      {
         lock_shared(sem_id);
         for (int k = 0; k < 2; k++)
-          for (int d = 0; d < cfg.n_dishes[k]; d++) {
+          for (int d = 0; d < cfg.n_dishes[k]; d++)
+          {
             shared->portions[k][d] += cfg.refill[k];
             if (shared->portions[k][d] > cfg.max_portions[k])
               shared->portions[k][d] = cfg.max_portions[k];
           }
         unlock_shared(sem_id);
+        next_refill = minute + next_refill_interval(cfg.refill_minutes, &seed);
       }
     }
-    if (requested_signal) {
+    if (requested_signal)
+    {
       termination = termination_signal_name();
       report_interrupted_day(day, &day_start, total_leftovers);
       completed_days++;
@@ -599,7 +715,8 @@ int main(int argc, char **argv) {
     drain_messages();
     print_stats(day, cfg.sim_duration, &day_start, total_leftovers);
     completed_days++;
-    if (overload) {
+    if (overload)
+    {
       termination = "overload";
       break;
     }
@@ -610,7 +727,8 @@ int main(int argc, char **argv) {
   lock_shared(sem_id);
   long long total_count = 0;
   double total_wait = 0;
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < 4; i++)
+  {
     total_wait += shared->wait_minutes[i];
     total_count += shared->wait_count[i];
   }
@@ -619,7 +737,8 @@ int main(int argc, char **argv) {
   int total_leftover_count =
       total_leftovers[0] + total_leftovers[1] + total_leftovers[2];
   int average_days = completed_days ? completed_days : 1;
-  if (stats_csv) {
+  if (stats_csv)
+  {
     CsvMetric metrics[] = {
         {"served", shared->served},
         {"unserved", shared->unserved},

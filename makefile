@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -Wvla -Wextra -Werror -Wall -D_GNU_SOURCE -g -I./
 SRCDIR = src
 BIN_DIR = bin
-TARGETS = $(BIN_DIR)/responsabile_mensa $(BIN_DIR)/operatore $(BIN_DIR)/operatore_cassa $(BIN_DIR)/utente
+TARGETS = $(BIN_DIR)/responsabile_mensa $(BIN_DIR)/operatore $(BIN_DIR)/operatore_cassa $(BIN_DIR)/utente $(BIN_DIR)/communication_disorder $(BIN_DIR)/add_users
 
 all: $(TARGETS)
 
@@ -21,9 +21,15 @@ $(BIN_DIR)/operatore_cassa: $(SRCDIR)/operatore_cassa.c $(SRCDIR)/helpers.c comm
 $(BIN_DIR)/utente: $(SRCDIR)/utente.c $(SRCDIR)/helpers.c common.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(SRCDIR)/utente.c $(SRCDIR)/helpers.c -o $@
 
+$(BIN_DIR)/communication_disorder: $(SRCDIR)/communication_disorder.c $(SRCDIR)/helpers.c common.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(SRCDIR)/communication_disorder.c $(SRCDIR)/helpers.c -o $@
+
+$(BIN_DIR)/add_users: $(SRCDIR)/add_users.c $(SRCDIR)/helpers.c common.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(SRCDIR)/add_users.c $(SRCDIR)/helpers.c -o $@
+
 .PHONY: all start timeout overload clean
 
-start: $(BIN_DIR)/responsabile_mensa
+start: $(TARGETS)
 	./$(BIN_DIR)/responsabile_mensa
 
 timeout: $(TARGETS)
@@ -33,4 +39,5 @@ overload: $(TARGETS)
 	./$(BIN_DIR)/responsabile_mensa "config overload.conf"
 
 clean:
-	rm -f $(TARGETS)
+	rm -f $(TARGETS) output.csv
+	rmdir --ignore-fail-on-non-empty $(BIN_DIR) 2>/dev/null || true

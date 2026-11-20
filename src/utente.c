@@ -2,10 +2,10 @@
 
 static void handle_stop_signal(int signal) { (void)signal; }
 
-static void record_unserved(int sid, Shared *sh) {
+static void record_unserved(int sid, Shared *sh, int count) {
   lock_shared(sid);
-  sh->unserved++;
-  sh->day_unserved++;
+  sh->unserved += count;
+  sh->day_unserved += count;
   unlock_shared(sid);
 }
 
@@ -21,7 +21,9 @@ static int request_service(int sid, int mid, Shared *sh, int station, int dish,
                  .user = getpid(),
                  .station = station,
                  .dish = dish,
-                 .coffee = coffee};
+                 .coffee = coffee,
+                 .has_ticket = 0,
+                 .group_size = 1};
   int idx = station - 1;
   lock_shared(sid);
   if (!sh->active) {
@@ -57,7 +59,9 @@ static int request_service(int sid, int mid, Shared *sh, int station, int dish,
   return rep.ok;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  int is_dynamic = (argc > 1 && atoi(argv[1]) == 1);
+
   int sid = semget(ftok(FTOK_PATH, FTOK_SEM), NUM_SEMAFORI, 0666);
   int mid = msgget(ftok(FTOK_PATH, FTOK_MSG), 0666);
   int hid = shmget(ftok(FTOK_PATH, FTOK_SHM), sizeof(Shared), 0666);
@@ -75,8 +79,15 @@ int main(void) {
   sigaction(SIGINT, &action, NULL);
 
   unsigned int seed = (unsigned int)getpid() ^ (unsigned int)time(NULL);
-  sem_v(sid, SEM_START);
-  sem_p(sid, SEM_GATE);
+  if (!is_dynamic) {
+    sem_v(sid, SEM_START);
+    sem_p(sid, SEM_GATE);
+  }
+
+  int has_ticket = (rand_r(&seed) % 100) < 80 ? 1 : 0;
+  int max_grp =
+      sh->cfg.max_users_per_group > 0 ? sh->cfg.max_users_per_group : 1;
+  int group_size = 1 + (int)(rand_r(&seed) % max_grp);
 
   int first = rand_r(&seed) % sh->cfg.n_dishes[0];
   int second = rand_r(&seed) % sh->cfg.n_dishes[1];
@@ -109,12 +120,12 @@ int main(void) {
   }
 
   if (!simulation_is_active(sid, sh)) {
-    record_unserved(sid, sh);
+    record_unserved(sid, sh, group_size);
     shmdt(sh);
     return 0;
   }
   if (!got_first && !got_second) {
-    record_unserved(sid, sh);
+    record_unserved(sid, sh, group_size);
     shmdt(sh);
     return 0;
   }
@@ -131,11 +142,13 @@ int main(void) {
                  .user = getpid(),
                  .dish = bits,
                  .coffee = got_coffee,
-                 .dessert = got_dessert};
+                 .dessert = got_dessert,
+                 .has_ticket = has_ticket,
+                 .group_size = group_size};
   lock_shared(sid);
   if (!sh->active) {
     unlock_shared(sid);
-    record_unserved(sid, sh);
+    record_unserved(sid, sh, group_size);
     shmdt(sh);
     return 0;
   }
@@ -149,7 +162,7 @@ int main(void) {
     int active = sh->active;
     unlock_shared(sid);
     if (!active)
-      record_unserved(sid, sh);
+      record_unserved(sid, sh, group_size);
     shmdt(sh);
     return 0;
   }
@@ -157,7 +170,7 @@ int main(void) {
   Reply ack;
   if (msgrcv(mid, &ack, sizeof ack - sizeof(long), (long)getpid(), 0) < 0) {
     if (!simulation_is_active(sid, sh))
-      record_unserved(sid, sh);
+      record_unserved(sid, sh, group_size);
     shmdt(sh);
     return 0;
   }
@@ -171,15 +184,26 @@ int main(void) {
   sh->day_wait_count[3]++;
   unlock_shared(sid);
 
-  sem_p(sid, SEM_TABLES);
-  if (simulation_is_active(sid, sh)) {
+  // Prenota i posti al tavolo per tutto il gruppo
+  int seats_taken = 0;
+  for (int i = 0; i < group_size; i++) {
+    sem_p(sid, SEM_TABLES);
+    seats_taken++;
+    if (!simulation_is_active(sid, sh))
+      break;
+  }
+
+  if (simulation_is_active(sid, sh) && seats_taken == group_size) {
     int dishes = got_first + got_second + got_coffee + got_dessert;
     int ms = dishes * 1000;
     long ns = scale_ms(&sh->cfg, ms);
     struct timespec ts = {ns / 1000000000, ns % 1000000000};
     nanosleep(&ts, NULL);
   }
-  sem_v(sid, SEM_TABLES);
+
+  for (int i = 0; i < seats_taken; i++) {
+    sem_v(sid, SEM_TABLES);
+  }
 
   shmdt(sh);
   return 0;

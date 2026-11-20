@@ -38,6 +38,8 @@ typedef struct {
   int max_portions[2], refill[2], service_ms[4], refill_minutes;
   int pauses, overload, day_minutes, minute_ns;
   int price[3], n_dishes[2], coffee_types, dessert_count;
+  // Nuovi parametri 30 punti
+  int stop_duration, ticket_discount, max_users_per_group;
   char dishes[2][MAX_DISHES][32];
   char sides[MAX_DISHES][32];
   char coffees[4][32], desserts[MAX_DISHES][32];
@@ -51,11 +53,16 @@ typedef struct {
   double wait_minutes[4], day_wait_minutes[4];
   long long wait_count[4], day_wait_count[4];
   double revenue, day_revenue;
+  // Nuovi campi 30 punti
+  int cassa_blocked;       // 1 = blocco pagamenti attivo, 0 = normale
+  int dynamic_users_added; // Contatore nuovi utenti aggiunti a runtime
 } Shared;
 typedef struct {
   long type;
   pid_t user;
   int station, dish, coffee, dessert;
+  int has_ticket; // 1 = utente con ticket, 0 = senza ticket
+  int group_size; // Numero persone nel gruppo (1 = singolo)
   long long enqueued_ns;
 } Message;
 typedef struct {
